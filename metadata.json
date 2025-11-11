@@ -1,0 +1,5 @@
+{
+  "name": "Video Transcriber & Summarizer",
+  "description": "Transcribe the audio from your video files and generate concise summaries, perfect for academic use. Upload a video, get transcription and an AI-generated summary, then download both as text files.",
+  "requestFramePermissions": []
+}
