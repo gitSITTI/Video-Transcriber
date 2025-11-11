@@ -1,5 +1,12 @@
-import { GoogleGenAI, LiveServerMessage } from '@google/genai';
-import { GEMINI_LIVE_MODEL, GEMINI_SUMMARIZER_MODEL, TARGET_SAMPLE_RATE, AUDIO_CHUNK_SIZE, SEND_INTERVAL_MS } from '../constants';
+import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
+import {
+  GEMINI_LIVE_MODEL,
+  GEMINI_SUMMARIZER_MODEL,
+  TARGET_SAMPLE_RATE,
+  AUDIO_CHUNK_SIZE,
+  SEND_INTERVAL_MS,
+  SESSION_CLOSE_DELAY_MS, // New import
+} from '../constants';
 import { createPcmBlob, encode, decode } from '../utils/audioUtils';
 import { TranscriptionChunk } from '../types';
 
@@ -24,12 +31,49 @@ export async function transcribeAudioStream(
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   let finalTranscriptionSegments: string[] = []; // Store final segments
   let latestNonFinalText = ''; // Track latest non-final text for UI
-  let intervalId: number | undefined;
+  let intervalId: number | undefined; // ID for the audio sending interval
+  let sessionClosureTimeoutId: number | undefined; // ID for the fallback session closure timeout
   let sentAudioLength = 0; // Track how much audio has been sent
   let allInputAudioSent = false; // Flag to indicate if all audio has been sent
 
   return new Promise<AudioProcessingResult>(async (resolve, reject) => {
-    let session: Awaited<ReturnType<typeof ai.live.connect>>;
+    let session: Awaited<ReturnType<typeof ai.live.connect>> | undefined; // Initialize as undefined
+
+    // Centralized cleanup function to clear all timers and close session
+    const cleanup = () => {
+      console.log('Performing cleanup: Clearing timers and closing session (if active).');
+      if (intervalId !== undefined) {
+        clearInterval(intervalId);
+        intervalId = undefined;
+      }
+      if (sessionClosureTimeoutId !== undefined) {
+        clearTimeout(sessionClosureTimeoutId);
+        sessionClosureTimeoutId = undefined;
+      }
+      // Note: session.close() is typically handled by onclose callback or explicit calls.
+      // We don't want to call it here if onclose is about to be called naturally.
+    };
+
+    const cleanupAndReject = (error: any) => {
+      console.error('Transcription failed, cleaning up and rejecting:', error);
+      cleanup();
+      if (session) {
+        // Ensure session is closed if an error occurs before onclose
+        try {
+          session.close();
+        } catch (closeError) {
+          console.error('Error closing session during rejection:', closeError);
+        }
+      }
+      reject(error);
+    };
+
+    const cleanupAndResolve = (fullTranscription: string) => {
+      console.log('Transcription finished, cleaning up and resolving.');
+      cleanup();
+      onProgressUpdate(100); // Ensure progress ends at 100%
+      resolve({ fullTranscription });
+    };
 
     try {
       session = await ai.live.connect({
@@ -40,10 +84,16 @@ export async function transcribeAudioStream(
             let currentOffset = 0;
             intervalId = window.setInterval(() => {
               if (currentOffset >= audioDataBuffer.length) {
-                clearInterval(intervalId);
+                if (intervalId !== undefined) clearInterval(intervalId); // Stop sending interval
                 console.log('Finished sending all audio chunks to Gemini Live.');
                 allInputAudioSent = true; // All audio input has been sent
-                // DO NOT close session here. Wait for model's final response or turnComplete.
+
+                // Start a fallback timeout to close the session if turnComplete doesn't arrive
+                sessionClosureTimeoutId = window.setTimeout(() => {
+                  console.log('Session closure timeout reached. Force-closing session.');
+                  // Only close if the session hasn't been closed by turnComplete yet
+                  if (session) session.close();
+                }, SESSION_CLOSE_DELAY_MS);
                 return;
               }
 
@@ -55,69 +105,76 @@ export async function transcribeAudioStream(
               const pcmBlob = createPcmBlob(chunk);
 
               try {
-                session.sendRealtimeInput({ media: pcmBlob });
+                if (session) session.sendRealtimeInput({ media: pcmBlob });
                 currentOffset = endOffset;
                 sentAudioLength = currentOffset; // Update sent length
                 onProgressUpdate((sentAudioLength / audioDataBuffer.length) * 100);
               } catch (sendError) {
                 console.error('Error sending audio chunk to Gemini Live:', sendError);
-                clearInterval(intervalId);
-                session.close();
-                reject(sendError);
+                cleanupAndReject(sendError);
               }
             }, SEND_INTERVAL_MS);
           },
           onmessage: (message: LiveServerMessage) => {
             console.log('Received message from Gemini Live:', message); // Log entire message for debugging
 
+            let currentTurnIsComplete = false;
+
             if (message.serverContent?.inputTranscription) {
-              const text = message.serverContent.inputTranscription.text;
-              const isFinal = message.serverContent.inputTranscription.isFinal || false;
-
-              console.log(`Transcription: "${text}", isFinal: ${isFinal}`);
-
-              if (isFinal) {
-                // Only add non-empty final segments
-                if (text.trim() !== '') {
-                  finalTranscriptionSegments.push(text.trim());
-                }
-                latestNonFinalText = ''; // Clear non-final text, as it's now part of final or discarded
-              } else {
-                latestNonFinalText = text; // Update latest non-final text
-              }
-
-              // Concatenate for UI update: final segments + latest non-final (if any)
-              const currentFullTextForDisplay =
-                finalTranscriptionSegments.join(' ') +
-                (latestNonFinalText ? ' ' + latestNonFinalText : '');
-
-              onTranscriptionUpdate({ text: currentFullTextForDisplay.trim(), isFinal: isFinal });
+              // Fix: inputTranscription does not have isFinal. Accumulate text.
+              latestNonFinalText += message.serverContent.inputTranscription.text;
             }
 
-            // Important: Use turnComplete to signal the end of the transcription process
-            if (allInputAudioSent && message.serverContent?.turnComplete) {
-              console.log('Gemini Live turn complete. Closing session.');
-              session.close(); // Explicitly close the session when the turn is complete
+            // Important: Use turnComplete to signal the definitive end of the current interaction
+            if (message.serverContent?.turnComplete) {
+              currentTurnIsComplete = true;
+              console.log('Gemini Live turn complete detected.');
+              if (sessionClosureTimeoutId !== undefined) clearTimeout(sessionClosureTimeoutId); // Clear fallback timeout
+
+              // Move accumulated non-final text to final segments if a turn completes
+              if (latestNonFinalText.trim() !== '') {
+                finalTranscriptionSegments.push(latestNonFinalText.trim());
+                latestNonFinalText = ''; // Reset for the next turn
+              }
+
+              // Explicitly close the session if all input audio has been sent and turn is complete.
+              // The onclose callback will then resolve the promise.
+              if (allInputAudioSent && session) {
+                console.log('All input audio sent and turn complete, closing session.');
+                session.close();
+              }
+            }
+
+            // Construct the full text for display: final segments + latest non-final (if any)
+            const currentFullTextForDisplay =
+              finalTranscriptionSegments.join(' ') +
+              (latestNonFinalText ? ' ' + latestNonFinalText : '');
+
+            // Only update UI if there's meaningful text or if it's the final update of a turn
+            if (currentFullTextForDisplay.trim() !== '' || currentTurnIsComplete) {
+              onTranscriptionUpdate({
+                text: currentFullTextForDisplay.trim(),
+                // Fix: isFinal is true only when the turn is explicitly marked complete by the API
+                isFinal: currentTurnIsComplete,
+              });
             }
           },
           onerror: (e: ErrorEvent) => {
             console.error('Gemini Live session error:', e);
-            clearInterval(intervalId);
-            session.close();
-            reject(new Error(`Transcription failed: ${e.message}`));
+            cleanupAndReject(new Error(`Transcription failed: ${e.message}`));
           },
           onclose: (e: CloseEvent) => {
             console.log('Gemini Live session closed:', e);
-            clearInterval(intervalId);
-            // After closing, ensure progress is 100% and resolve with concatenated final segments.
-            onProgressUpdate(100);
+            // This callback is always called when session.close() is invoked.
+            // It's the final point to resolve the promise.
             const fullTranscription = finalTranscriptionSegments.join(' ').trim();
-            console.log('Final accumulated transcription:', fullTranscription);
-            resolve({ fullTranscription });
+            console.log('Final accumulated transcription (onclose):', fullTranscription);
+            cleanupAndResolve(fullTranscription);
           },
         },
         config: {
-          responseModalities: ['AUDIO'], // Even though we only care about text, audio is required.
+          // Fix: Use Modality.AUDIO from the SDK
+          responseModalities: [Modality.AUDIO], // Even though we only care about text, audio is required.
           inputAudioTranscription: {}, // Enable transcription for user input audio.
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
@@ -126,9 +183,8 @@ export async function transcribeAudioStream(
       });
     } catch (error) {
       console.error('Failed to connect to Gemini Live session:', error);
-      clearInterval(intervalId);
-      if (session) session.close(); // Ensure session is closed if connection failed early
-      reject(error);
+      // If connection fails, session might not be initialized, so check before trying to close.
+      cleanupAndReject(error);
     }
   });
 }

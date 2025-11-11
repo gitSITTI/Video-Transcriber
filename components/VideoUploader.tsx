@@ -1,11 +1,17 @@
 import React, { useCallback, useRef, useState } from 'react';
-import { AppState } from '../types';
+import { AppState, TranscriptionService } from '../types';
+import { formatDuration } from '../utils/audioUtils';
 
 interface VideoUploaderProps {
   onVideoSelect: (file: File) => void;
   appState: AppState;
   errorMessage: string | null;
   transcriptionProgress: number;
+  totalAudioDuration: number;
+  selectedService: TranscriptionService; // New prop
+  onServiceSelect: (service: TranscriptionService) => void; // New prop
+  openaiApiKey: string | null; // New prop for OpenAI API key
+  onOpenaiApiKeyChange: (key: string) => void; // New prop for API key change handler
 }
 
 const VideoUploader: React.FC<VideoUploaderProps> = ({
@@ -13,6 +19,11 @@ const VideoUploader: React.FC<VideoUploaderProps> = ({
   appState,
   errorMessage,
   transcriptionProgress,
+  totalAudioDuration,
+  selectedService,
+  onServiceSelect,
+  openaiApiKey,
+  onOpenaiApiKeyChange,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -57,12 +68,25 @@ const VideoUploader: React.FC<VideoUploaderProps> = ({
     appState === AppState.TRANSCRIBING ||
     appState === AppState.SUMMARIZING;
 
+  // Disable "Browse Files" if OpenAI is selected and key is missing
+  const isBrowseDisabled = isLoading || (selectedService === TranscriptionService.OPENAI_WHISPER && !openaiApiKey);
+
   const getLoadingMessage = () => {
+    let serviceName = '';
+    if (selectedService === TranscriptionService.GEMINI_LIVE) {
+      serviceName = 'Gemini Live';
+    } else if (selectedService === TranscriptionService.OPENAI_WHISPER) {
+      serviceName = 'OpenAI Whisper';
+    }
+
     switch (appState) {
       case AppState.UPLOADING:
         return 'Extracting audio...';
       case AppState.TRANSCRIBING:
-        return `Transcribing audio: ${transcriptionProgress.toFixed(0)}%`;
+        const formattedTotalDuration = formatDuration(totalAudioDuration);
+        const elapsedSeconds = (totalAudioDuration * transcriptionProgress) / 100;
+        const formattedElapsed = formatDuration(elapsedSeconds);
+        return `Transcribing audio (${serviceName}): ${transcriptionProgress.toFixed(0)}% (${formattedElapsed} / ${formattedTotalDuration})`;
       case AppState.SUMMARIZING:
         return 'Generating summary...';
       default:
@@ -88,8 +112,67 @@ const VideoUploader: React.FC<VideoUploaderProps> = ({
         className="hidden"
         onChange={handleChange}
         accept="video/*"
-        disabled={isLoading}
+        disabled={isBrowseDisabled}
       />
+
+      <div className="mb-6 w-full text-center">
+        <label className="block text-gray-300 text-lg font-semibold mb-3">
+          Choose Transcription Service:
+        </label>
+        <div className="flex justify-center space-x-4">
+          <label className="inline-flex items-center">
+            <input
+              type="radio"
+              className="form-radio text-indigo-600 focus:ring-indigo-500 h-4 w-4"
+              name="transcriptionService"
+              value={TranscriptionService.GEMINI_LIVE}
+              checked={selectedService === TranscriptionService.GEMINI_LIVE}
+              onChange={() => onServiceSelect(TranscriptionService.GEMINI_LIVE)}
+              disabled={isLoading}
+            />
+            <span className="ml-2 text-gray-200">Google Gemini Live</span>
+          </label>
+          <label className="inline-flex items-center">
+            <input
+              type="radio"
+              className="form-radio text-indigo-600 focus:ring-indigo-500 h-4 w-4"
+              name="transcriptionService"
+              value={TranscriptionService.OPENAI_WHISPER}
+              checked={selectedService === TranscriptionService.OPENAI_WHISPER}
+              onChange={() => onServiceSelect(TranscriptionService.OPENAI_WHISPER)}
+              disabled={isLoading}
+            />
+            <span className="ml-2 text-gray-200">OpenAI Whisper</span>
+          </label>
+        </div>
+      </div>
+
+      {selectedService === TranscriptionService.OPENAI_WHISPER && (
+        <div className="mb-6 w-full px-4">
+          <label htmlFor="openai-api-key" className="block text-gray-300 text-sm font-semibold mb-2">
+            OpenAI API Key:
+          </label>
+          <input
+            id="openai-api-key"
+            type="password"
+            className="w-full p-2 bg-gray-700 text-white rounded-md border border-gray-600 focus:outline-none focus:border-indigo-500"
+            placeholder="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            value={openaiApiKey || ''}
+            onChange={(e) => onOpenaiApiKeyChange(e.target.value)}
+            disabled={isLoading}
+            aria-label="OpenAI API Key"
+          />
+          {!openaiApiKey && !isLoading && selectedService === TranscriptionService.OPENAI_WHISPER && (
+            <p className="text-red-400 text-xs mt-1">
+              An OpenAI API key is required for Whisper transcription. Get one at{' '}
+              <a href="https://platform.openai.com/account/api-keys" target="_blank" rel="noopener noreferrer" className="text-indigo-300 hover:underline">
+                OpenAI API Keys
+              </a>.
+            </p>
+          )}
+        </div>
+      )}
+
       {isLoading ? (
         <div className="flex flex-col items-center text-indigo-300">
           <svg
@@ -137,7 +220,7 @@ const VideoUploader: React.FC<VideoUploaderProps> = ({
           <button
             onClick={onClick}
             className="px-6 py-2 bg-indigo-600 text-white font-semibold rounded-md hover:bg-indigo-700 transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-gray-900"
-            disabled={isLoading}
+            disabled={isBrowseDisabled}
           >
             Browse Files
           </button>

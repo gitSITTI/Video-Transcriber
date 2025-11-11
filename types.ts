@@ -11,3 +11,8 @@ export interface TranscriptionChunk {
   text: string;
   isFinal: boolean;
 }
+
+export enum TranscriptionService {
+  GEMINI_LIVE = 'GEMINI_LIVE',
+  OPENAI_WHISPER = 'OPENAI_WHISPER',
+}

@@ -1,15 +1,16 @@
 import React, { useState, useCallback, useRef } from 'react';
 import VideoUploader from './components/VideoUploader';
 import TranscriptionDisplay from './components/TranscriptionDisplay';
-import { AppState, TranscriptionChunk } from './types';
+import { AppState, TranscriptionChunk, TranscriptionService } from './types';
 import {
   extractAudioBufferFromVideoFile,
   resampleAudioBuffer,
+  formatDuration,
+  createWavBlobFromAudioBuffer, // New import for WAV creation
 } from './utils/audioUtils';
 import { transcribeAudioStream, summarizeText } from './services/geminiService';
+import { transcribeWithWhisper } from './services/openaiService'; // New import for OpenAI service
 import { TARGET_SAMPLE_RATE } from './constants';
-import { GoogleGenAI, LiveServerMessage } from '@google/genai';
-
 
 function App() {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
@@ -17,17 +18,27 @@ function App() {
   const [summary, setSummary] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [transcriptionProgress, setTranscriptionProgress] = useState<number>(0);
+  const [totalAudioDuration, setTotalAudioDuration] = useState<number>(0);
+  const [selectedTranscriptionService, setSelectedTranscriptionService] = useState<TranscriptionService>(
+    TranscriptionService.GEMINI_LIVE, // Default to Gemini Live
+  );
+  const [openaiApiKey, setOpenaiApiKey] = useState<string | null>(null); // State for OpenAI API key
 
-  // Using a ref to accumulate transcription chunks for a smoother UI update experience
-  // This ref is no longer directly used for accumulation in App.tsx after refactoring transcribeAudioStream
-  // but it's fine to keep it if there's other potential future use.
   const currentTranscriptionRef = useRef<string>('');
 
   const handleTranscriptionUpdate = useCallback((chunk: TranscriptionChunk) => {
-    // `text` from `transcribeAudioStream` is now cumulative for display.
-    // We simply update the transcription state with the provided text.
     setTranscription(chunk.text);
-    currentTranscriptionRef.current = chunk.text; // Keep ref updated for consistency if needed elsewhere
+    currentTranscriptionRef.current = chunk.text;
+  }, []);
+
+  const handleServiceSelect = useCallback((service: TranscriptionService) => {
+    setSelectedTranscriptionService(service);
+    setErrorMessage(null); // Clear errors when switching service
+  }, []);
+
+  const handleOpenaiApiKeyChange = useCallback((key: string) => {
+    setOpenaiApiKey(key.trim());
+    setErrorMessage(null); // Clear errors when API key changes
   }, []);
 
   const handleVideoSelect = useCallback(async (file: File) => {
@@ -36,38 +47,59 @@ function App() {
     setTranscription('');
     setSummary('');
     setTranscriptionProgress(0);
-    currentTranscriptionRef.current = ''; // Reset ref
+    currentTranscriptionRef.current = '';
+    setTotalAudioDuration(0);
 
     try {
+      if (selectedTranscriptionService === TranscriptionService.OPENAI_WHISPER && !openaiApiKey) {
+        throw new Error('Please provide your OpenAI API key to use Whisper transcription.');
+      }
+
       // 1. Extract audio from video file
       const audioBuffer = await extractAudioBufferFromVideoFile(file);
       console.log('Original Audio Buffer:', audioBuffer);
 
-      // 2. Resample audio to target sample rate for Gemini Live API
-      const resampledAudioBuffer = await resampleAudioBuffer(
-        audioBuffer,
-        TARGET_SAMPLE_RATE,
-      );
-      console.log('Resampled Audio Buffer:', resampledAudioBuffer);
+      // Calculate total audio duration and store it
+      const durationInSeconds = audioBuffer.length / audioBuffer.sampleRate;
+      setTotalAudioDuration(durationInSeconds);
+      console.log(`Video audio duration: ${formatDuration(durationInSeconds)}`);
 
-      // Get the audio data as a Float32Array
-      const audioData = resampledAudioBuffer.getChannelData(0);
+      let transcriptionResult;
 
-      // 3. Transcribe the audio stream using Gemini Live API
+      // 2. Transcribe based on selected service
       setAppState(AppState.TRANSCRIBING);
 
-      // Call the refactored transcribeAudioStream function
-      const transcriptionResult = await transcribeAudioStream(
-        audioData,
-        handleTranscriptionUpdate, // Callback for displaying intermediate/final transcription
-        setTranscriptionProgress,    // Callback for progress updates
-      );
+      if (selectedTranscriptionService === TranscriptionService.GEMINI_LIVE) {
+        console.log('Using Google Gemini Live for transcription.');
+        const resampledAudioBuffer = await resampleAudioBuffer(
+          audioBuffer,
+          TARGET_SAMPLE_RATE,
+        );
+        const audioData = resampledAudioBuffer.getChannelData(0);
+        transcriptionResult = await transcribeAudioStream(
+          audioData,
+          handleTranscriptionUpdate,
+          setTranscriptionProgress,
+        );
+      } else { // TranscriptionService.OPENAI_WHISPER
+        console.log('Using OpenAI Whisper for transcription.');
+        // For Whisper, we need a WAV blob
+        const wavBlob = createWavBlobFromAudioBuffer(audioBuffer);
+        
+        // Whisper API is not streaming; progress will update at start and end
+        setTranscriptionProgress(1); // Set to a small value to show it's started
+        transcriptionResult = await transcribeWithWhisper(
+          openaiApiKey!, // Use the user-provided key
+          wavBlob,
+          handleTranscriptionUpdate,
+          setTranscriptionProgress, // Will be called once with 100% on completion
+        );
+      }
 
-      // `transcriptionResult.fullTranscription` now contains the complete concatenated transcription
       setTranscription(transcriptionResult.fullTranscription);
       setTranscriptionProgress(100); // Ensure it ends at 100%
 
-      // 4. Summarize the transcription
+      // 3. Summarize the transcription
       setAppState(AppState.SUMMARIZING);
       const generatedSummary = await summarizeText(transcriptionResult.fullTranscription);
       setSummary(generatedSummary);
@@ -78,7 +110,7 @@ function App() {
       setErrorMessage(`Failed to process video: ${error instanceof Error ? error.message : String(error)}`);
       setAppState(AppState.ERROR);
     }
-  }, [handleTranscriptionUpdate]); // handleTranscriptionUpdate is stable due to useCallback
+  }, [handleTranscriptionUpdate, selectedTranscriptionService, openaiApiKey]);
 
   const handleReset = useCallback(() => {
     setAppState(AppState.IDLE);
@@ -87,6 +119,8 @@ function App() {
     setErrorMessage(null);
     setTranscriptionProgress(0);
     currentTranscriptionRef.current = '';
+    setTotalAudioDuration(0);
+    // Do not reset selectedTranscriptionService or openaiApiKey here, user choice persists
   }, []);
 
   return (
@@ -101,6 +135,11 @@ function App() {
           appState={appState}
           errorMessage={errorMessage}
           transcriptionProgress={transcriptionProgress}
+          totalAudioDuration={totalAudioDuration}
+          selectedService={selectedTranscriptionService}
+          onServiceSelect={handleServiceSelect}
+          openaiApiKey={openaiApiKey}
+          onOpenaiApiKeyChange={handleOpenaiApiKeyChange}
         />
       ) : (
         <TranscriptionDisplay
@@ -109,11 +148,6 @@ function App() {
           onReset={handleReset}
         />
       )}
-
-      {/* Persistent Call-to-Action (Example - if needed, for simplicity kept within main flow for now) */}
-      {/* <div className="fixed bottom-0 left-0 right-0 bg-gray-900 bg-opacity-80 p-4 text-center">
-        <p className="text-gray-400 text-sm">Need help? Contact support.</p>
-      </div> */}
     </div>
   );
 }

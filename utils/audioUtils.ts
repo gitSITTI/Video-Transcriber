@@ -8,6 +8,7 @@ import { TARGET_SAMPLE_RATE } from '../constants';
 export function decode(base64: string): Uint8Array {
   const binaryString = atob(base64);
   const len = binaryString.length;
+  // Fix: Declare bytes as a Uint8Array
   const bytes = new Uint8Array(len);
   for (let i = 0; i < len; i++) {
     bytes[i] = binaryString.charCodeAt(i);
@@ -100,5 +101,86 @@ export async function extractAudioBufferFromVideoFile(file: File): Promise<Audio
     // It's good practice to close contexts when no longer needed, though for decodeAudioData,
     // the context often remains active implicitly until its resources are garbage collected.
     // For single-shot decoding, not strictly necessary to close immediately.
+  }
+}
+
+/**
+ * Formats a duration in seconds into a MM:SS string.
+ * @param seconds The duration in seconds.
+ * @returns The formatted duration string (e.g., "02:30").
+ */
+export function formatDuration(seconds: number): string {
+  if (isNaN(seconds) || seconds < 0) {
+    return '00:00';
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.floor(seconds % 60);
+  const pad = (num: number) => num.toString().padStart(2, '0');
+  return `${pad(minutes)}:${pad(remainingSeconds)}`;
+}
+
+/**
+ * Creates a WAV audio Blob from an AudioBuffer.
+ * @param audioBuffer The AudioBuffer to convert.
+ * @returns A Blob containing the WAV audio data.
+ */
+export function createWavBlobFromAudioBuffer(audioBuffer: AudioBuffer): Blob {
+  const numberOfChannels = audioBuffer.numberOfChannels;
+  const sampleRate = audioBuffer.sampleRate;
+  const format = 1; // PCM
+  const bitDepth = 16; // 16-bit PCM
+
+  let totalLength = audioBuffer.length * numberOfChannels * (bitDepth / 8);
+  let buffer = new ArrayBuffer(44 + totalLength); // 44 bytes for header
+
+  let view = new DataView(buffer);
+  let offset = 0;
+
+  /* RIFF identifier */
+  writeString(view, offset, 'RIFF'); offset += 4;
+  /* file length */
+  view.setUint32(offset, 36 + totalLength, true); offset += 4;
+  /* RIFF type */
+  writeString(view, offset, 'WAVE'); offset += 4;
+  /* format chunk identifier */
+  writeString(view, offset, 'fmt '); offset += 4;
+  /* format chunk length */
+  view.setUint32(offset, 16, true); offset += 4;
+  /* sample format (raw) */
+  view.setUint16(offset, format, true); offset += 2;
+  /* channel count */
+  view.setUint16(offset, numberOfChannels, true); offset += 2;
+  /* sample rate */
+  view.setUint32(offset, sampleRate, true); offset += 4;
+  /* byte rate (sampleRate * blockAlign) */
+  view.setUint32(offset, sampleRate * numberOfChannels * (bitDepth / 8), true); offset += 4;
+  /* block align (channelCount * bytesPerSample) */
+  view.setUint16(offset, numberOfChannels * (bitDepth / 8), true); offset += 2;
+  /* bits per sample */
+  view.setUint16(offset, bitDepth, true); offset += 2;
+  /* data chunk identifier */
+  writeString(view, offset, 'data'); offset += 4;
+  /* data chunk length */
+  view.setUint32(offset, totalLength, true); offset += 4;
+
+  // Write audio data
+  let dataOffset = offset;
+  for (let i = 0; i < audioBuffer.numberOfChannels; i++) {
+    const channelData = audioBuffer.getChannelData(i);
+    for (let j = 0; j < channelData.length; j++) {
+      // Convert float to 16-bit signed integer
+      let s = Math.max(-1, Math.min(1, channelData[j]));
+      s = s < 0 ? s * 0x8000 : s * 0x7FFF; // Scale to Int16 range
+      view.setInt16(dataOffset, s, true);
+      dataOffset += 2; // 2 bytes for 16-bit
+    }
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+function writeString(view: DataView, offset: number, string: string) {
+  for (let i = 0; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i));
   }
 }
